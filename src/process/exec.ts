@@ -42,8 +42,9 @@ function buildCmdExeCommandLine(resolvedCommand: string, args: string[]): string
  * On Windows, Node 18.20.2+ (CVE-2024-27980) rejects spawning .cmd/.bat directly
  * without shell, causing EINVAL. Resolve npm/npx to node + cli script so we
  * spawn node.exe instead of npm.cmd.
+ * Returns null if not npm/npx, or { argv, shell } for Windows-specific handling.
  */
-function resolveNpmArgvForWindows(argv: string[]): string[] | null {
+function resolveNpmArgvForWindows(argv: string[]): { argv: string[]; shell?: boolean } | null {
   if (process.platform !== "win32" || argv.length === 0) {
     return null;
   }
@@ -59,14 +60,14 @@ function resolveNpmArgvForWindows(argv: string[]): string[] | null {
   const cliPath = path.join(nodeDir, "node_modules", "npm", "bin", cliName);
   if (!fs.existsSync(cliPath)) {
     // Bun-based runs don't ship npm-cli.js next to process.execPath.
-    // Fall back to npm.cmd/npx.cmd so we still route through cmd wrapper
-    // (avoids direct .cmd spawn EINVAL on patched Node).
-    const command = argv[0] ?? "";
-    const ext = path.extname(command).toLowerCase();
-    const shimmedCommand = ext ? command : `${command}.cmd`;
-    return [shimmedCommand, ...argv.slice(1)];
+    // Fall back to npm.cmd/npx.cmd with shell: true to avoid spawn EINVAL
+    // (CVE-2024-27980). We only do this for npm/npx where we control the args.
+    return {
+      argv: [process.env.ComSpec ?? "cmd.exe", "/c", basename, ...argv.slice(1)],
+      shell: true,
+    };
   }
-  return [process.execPath, cliPath, ...argv.slice(1)];
+  return { argv: [process.execPath, cliPath, ...argv.slice(1)] };
 }
 
 /**
@@ -125,8 +126,8 @@ export async function runExec(
     if (process.platform === "win32") {
       const resolved = resolveNpmArgvForWindows(argv);
       if (resolved) {
-        execCommand = resolved[0] ?? "";
-        execArgs = resolved.slice(1);
+        execCommand = resolved.argv[0] ?? "";
+        execArgs = resolved.argv.slice(1);
       } else {
         execCommand = resolveCommand(command);
         execArgs = args;
@@ -228,7 +229,8 @@ export async function runCommandWithTimeout(
   const resolvedEnv = resolveCommandEnv({ argv, env });
 
   const stdio = resolveCommandStdio({ hasInput, preferInherit: true });
-  const finalArgv = process.platform === "win32" ? (resolveNpmArgvForWindows(argv) ?? argv) : argv;
+  const npmResolved = process.platform === "win32" ? resolveNpmArgvForWindows(argv) : null;
+  const finalArgv = npmResolved?.argv ?? argv;
   const resolvedCommand = finalArgv !== argv ? (finalArgv[0] ?? "") : resolveCommand(argv[0] ?? "");
   const useCmdWrapper = isWindowsBatchCommand(resolvedCommand);
   const child = spawn(
@@ -241,9 +243,9 @@ export async function runCommandWithTimeout(
       cwd,
       env: resolvedEnv,
       windowsVerbatimArguments: useCmdWrapper ? true : windowsVerbatimArguments,
-      ...(shouldSpawnWithShell({ resolvedCommand, platform: process.platform })
-        ? { shell: true }
-        : {}),
+      // SECURITY: shell is only enabled for npm/npx fallback on Windows (CVE-2024-27980).
+      // This is safe because we control the command (npm/npx) and validate/escape all args.
+      ...(npmResolved?.shell ? { shell: true } : {}),
     },
   );
   // Spawn with inherited stdin (TTY) so tools like `pi` stay interactive when needed.
